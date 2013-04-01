@@ -8,6 +8,10 @@ module System.Modbus.TCP
   , MB_Exception(..)
   , Exception(..)
 
+  , TransactionIdentifier
+  , ProtocolIdentifier
+  , UnitIdentifier
+
   , command
 
   , readCoils
