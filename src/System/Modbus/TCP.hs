@@ -1,6 +1,11 @@
 {-# LANGUAGE PackageImports #-}
 {-# LANGUAGE UnicodeSyntax  #-}
 
+-- | An implementation of the Modbus TPC/IP protocol.
+--
+-- This implementation is based on the @MODBUS Application Protocol
+-- Specification V1.1b@
+-- (<http://www.modbus.org/docs/Modbus_Application_Protocol_V1_1b.pdf>).
 module System.Modbus.TCP
   ( TCP_ADU(..)
   , Header(..)
@@ -8,9 +13,9 @@ module System.Modbus.TCP
   , MB_Exception(..)
   , Exception(..)
 
-  , TransactionIdentifier
-  , ProtocolIdentifier
-  , UnitIdentifier
+  , TransactionId
+  , ProtocolId
+  , UnitId
 
   , command
 
@@ -24,7 +29,7 @@ module System.Modbus.TCP
   ) where
 
 import "base" Control.Applicative ( (<*>) )
-import "base" Control.Monad ( replicateM )
+import "base" Control.Monad ( replicateM, mzero )
 import "base" Data.Functor ( (<$>) )
 import "base" Data.Word ( Word8, Word16 )
 import "base-unicode-symbols" Data.Bool.Unicode     ( (∧), (∨) )
@@ -45,11 +50,13 @@ import qualified "network" Network.Socket as S hiding ( send, recv )
 import qualified "network" Network.Socket.ByteString as S ( send, recv )
 
 
-type TransactionIdentifier = Word16
-type ProtocolIdentifier    = Word16
-type UnitIdentifier        = Word8
+type TransactionId = Word16
+type ProtocolId    = Word16
+type UnitId        = Word8
 
 -- | MODBUS TCP/IP Application Data Unit
+--
+-- See: MODBUS Application Protocol Specification V1.1b, section 4.1
 data TCP_ADU =
   TCP_ADU { aduHeader   ∷ Header
           , aduFunction ∷ FunctionCode
@@ -65,11 +72,13 @@ instance Serialize TCP_ADU where
     return $ TCP_ADU header fc ws
 
 -- | MODBUS Application Protocol Header
+--
+-- See: MODBUS Application Protocol Specification V1.1b, section 4.1
 data Header =
-  Header { hdrTransactionIdentifer ∷ TransactionIdentifier
-         , hdrProtocolIdentifier   ∷ ProtocolIdentifier
-         , hdrLength               ∷ Word16
-         , hdrUnitIdentifier       ∷ UnitIdentifier
+  Header { hdrTransactionId ∷ TransactionId
+         , hdrProtocolId    ∷ ProtocolId
+         , hdrLength        ∷ Word16
+         , hdrUnitId        ∷ UnitId
          } deriving Show
 
 instance Serialize Header where
@@ -77,27 +86,59 @@ instance Serialize Header where
     putWord16be tid >> putWord16be pid >> putWord16be len >> putWord8 uid
   get = Header <$> getWord16be <*> getWord16be <*> getWord16be <*> getWord8
 
+-- | The function code field of a MODBUS data unit is coded in one
+-- byte. Valid codes are in the range of 1 ... 255 decimal (the range
+-- 128 - 255 is reserved and used for exception responses). When a
+-- message is sent from a Client to a Server device the function code
+-- field tells the server what kind of action to perform. Function
+-- code 0 is not valid.
+--
+-- Sub-function codes are added to some function codes to define
+-- multiple actions.
+--
+-- See: MODBUS Application Protocol Specification V1.1b, sections 4.1 and 5
 data FunctionCode =
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.1
     ReadCoils
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.2
   | ReadDiscreteInputs
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.3
   | ReadHoldingRegisters
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.4
   | ReadInputRegisters
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.5
   | WriteSingleCoil
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.6
   | WriteSingleRegister
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.7
   | ReadExceptionStatus
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.8
   | Diagnostics
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.9
   | GetCommEventCounter
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.10
   | GetCommEventLog
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.11
   | WriteMultipleCoils
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.12
   | WriteMultipleRegisters
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.13
   | ReportSlaveID
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.14
   | ReadFileRecord
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.15
   | WriteFileRecord
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.16
   | MaskWriteRegister
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.17
   | ReadWriteMultipleRegisters
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.18
   | ReadFIFOQueue
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 6.19
   | EncapsulatedInterfaceTransport
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 5
   | UserDefinedCode   Word8
+    -- | See: MODBUS Application Protocol Specification V1.1b, section 5
   | ReservedCode      Word8
   | OtherCode         Word8
   | ExceptionCode FunctionCode
@@ -160,15 +201,69 @@ instance Serialize FunctionCode where
                | code ≥ 0x80 = ExceptionCode $ dec $ code - 0x80
                | otherwise = OtherCode code
 
+-- | See: MODBUS Application Protocol Specification V1.1b, section 7
 data MB_Exception =
+    -- | The function code received in the query is not an allowable
+    -- action for the server (or slave). This may be because the
+    -- function code is only applicable to newer devices, and was not
+    -- implemented in the unit selected. It could also indicate that
+    -- the server (or slave) is in the wrong state to process a
+    -- request of this type, for example because it is unconfigured
+    -- and is being asked to return register values.
     IllegalFunction
+    -- | The data address received in the query is not an allowable
+    -- address for the server (or slave). More specifically, the
+    -- combination of reference number and transfer length is
+    -- invalid. For a controller with 100 registers, the PDU addresses
+    -- the first register as 0, and the last one as 99. If a request
+    -- is submitted with a starting register address of 96 and a
+    -- quantity of registers of 4, then this request will successfully
+    -- operate (address-wise at least) on registers 96, 97, 98, 99. If
+    -- a request is submitted with a starting register address of 96
+    -- and a quantity of registers of 5, then this request will fail
+    -- with Exception Code 0x02 \"Illegal Data Address\" since it
+    -- attempts to operate on registers 96, 97, 98, 99 and 100, and
+    -- there is no register with address 100.
   | IllegalDataAddress
+    -- | A value contained in the query data field is not an allowable
+    -- value for server (or slave). This indicates a fault in the
+    -- structure of the remainder of a complex request, such as that
+    -- the implied length is incorrect. It specifically does NOT mean
+    -- that a data item submitted for storage in a register has a
+    -- value outside the expectation of the application program, since
+    -- the MODBUS protocol is unaware of the significance of any
+    -- particular value of any particular register.
   | IllegalDataValue
+    -- | An unrecoverable error occurred while the server (or slave)
+    -- was attempting to perform the requested action.
   | SlaveDeviceFailure
+    -- | Specialized use in conjunction with programming commands. The
+    -- server (or slave) has accepted the request and is processing
+    -- it, but a long duration of time will be required to do so. This
+    -- response is returned to prevent a timeout error from occurring
+    -- in the client (or master). The client (or master) can next
+    -- issue a Poll Program Complete message to determine if
+    -- processing is completed.
   | Acknowledge
+    -- | Specialized use in conjunction with programming commands. The
+    -- server (or slave) is engaged in processing a long–duration
+    -- program command. The client (or master) should retransmit the
+    -- message later when the server (or slave) is free.
   | SlaveDeviceBusy
+    -- | Specialized use in conjunction with function codes
+    -- 'ReadFileRecord' and 'WriteFileRecord' and reference type 6, to
+    -- indicate that the extended file area failed to pass a
+    -- consistency check.
   | MemoryParityError
+    -- | Specialized use in conjunction with gateways, indicates that
+    -- the gateway was unable to allocate an internal communication
+    -- path from the input port to the output port for processing the
+    -- request. Usually means that the gateway is misconfigured or
+    -- overloaded.
   | GatewayPathUnavailable
+    -- | Specialized use in conjunction with gateways, indicates that
+    -- no response was obtained from the target device. Usually means
+    -- that the device is not present on the network.
   | GatewayTargetDeviceFailedToRespond
     deriving Show
 
@@ -185,29 +280,30 @@ instance Serialize MB_Exception where
       enc GatewayPathUnavailable             = 0x0A
       enc GatewayTargetDeviceFailedToRespond = 0x0B
 
-  get = getWord8 >>= return ∘ dec
+  get = getWord8 >>= dec
     where
-      dec 0x01 = IllegalFunction
-      dec 0x02 = IllegalDataAddress
-      dec 0x03 = IllegalDataValue
-      dec 0x04 = SlaveDeviceFailure
-      dec 0x05 = Acknowledge
-      dec 0x06 = SlaveDeviceBusy
-      dec 0x08 = MemoryParityError
-      dec 0x0A = GatewayPathUnavailable
-      dec 0x0B = GatewayTargetDeviceFailedToRespond
-      dec _    = error "TODO"
+      dec 0x01 = return IllegalFunction
+      dec 0x02 = return IllegalDataAddress
+      dec 0x03 = return IllegalDataValue
+      dec 0x04 = return SlaveDeviceFailure
+      dec 0x05 = return Acknowledge
+      dec 0x06 = return SlaveDeviceBusy
+      dec 0x08 = return MemoryParityError
+      dec 0x0A = return GatewayPathUnavailable
+      dec 0x0B = return GatewayTargetDeviceFailedToRespond
+      dec _    = mzero
 
 data Exception = ExceptionResponse FunctionCode MB_Exception
                | DecodeException String
                | OtherException String
                  deriving Show
 
-command ∷ TransactionIdentifier
-        → ProtocolIdentifier
-        → UnitIdentifier
-        → FunctionCode
-        → ByteString
+-- | Sends a raw MODBUS command.
+command ∷ TransactionId
+        → ProtocolId
+        → UnitId
+        → FunctionCode -- ^ PDU function code.
+        → ByteString   -- ^ PDU data.
         → S.Socket
         → IO (Either Exception TCP_ADU)
 command tid pid uid fc fdata socket = do
@@ -227,9 +323,9 @@ checkResponse adu@(TCP_ADU _ fc bs) =
                               $ decode bs
       _ → Right adu
 
-readCoils ∷ TransactionIdentifier
-          → ProtocolIdentifier
-          → UnitIdentifier
+readCoils ∷ TransactionId
+          → ProtocolId
+          → UnitId
           → Word16
           → Word16
           → S.Socket
@@ -243,9 +339,9 @@ readCoils tid pid uid addr count socket =
                        (runPut $ putWord16be addr >> putWord16be count)
                        socket
 
-readDiscreteInputs ∷ TransactionIdentifier
-                   → ProtocolIdentifier
-                   → UnitIdentifier
+readDiscreteInputs ∷ TransactionId
+                   → ProtocolId
+                   → UnitId
                    → Word16
                    → Word16
                    → S.Socket
@@ -259,9 +355,9 @@ readDiscreteInputs tid pid uid addr count socket =
                        (runPut $ putWord16be addr >> putWord16be count)
                        socket
 
-readHoldingRegisters ∷ TransactionIdentifier
-                     → ProtocolIdentifier
-                     → UnitIdentifier
+readHoldingRegisters ∷ TransactionId
+                     → ProtocolId
+                     → UnitId
                      → Word16 -- ^ Register starting address.
                      → Word16 -- ^ Quantity of registers.
                      → S.Socket
@@ -275,9 +371,9 @@ readHoldingRegisters tid pid uid addr count socket =
                        (runPut $ putWord16be addr >> putWord16be count)
                        socket
 
-readInputRegisters ∷ TransactionIdentifier
-                   → ProtocolIdentifier
-                   → UnitIdentifier
+readInputRegisters ∷ TransactionId
+                   → ProtocolId
+                   → UnitId
                    → Word16 -- ^ Starting address.
                    → Word16 -- ^ Quantity of input registers.
                    → S.Socket
@@ -291,9 +387,9 @@ readInputRegisters tid pid uid addr count socket =
                        (runPut $ putWord16be addr >> putWord16be count)
                        socket
 
-writeSingleCoil ∷ TransactionIdentifier
-                → ProtocolIdentifier
-                → UnitIdentifier
+writeSingleCoil ∷ TransactionId
+                → ProtocolId
+                → UnitId
                 → Word16
                 → Bool
                 → S.Socket
@@ -304,9 +400,9 @@ writeSingleCoil tid pid uid addr value socket = do
                    socket
     return $ either Left (const $ Right ()) resp
 
-writeSingleRegister ∷ TransactionIdentifier
-                    → ProtocolIdentifier
-                    → UnitIdentifier
+writeSingleRegister ∷ TransactionId
+                    → ProtocolId
+                    → UnitId
                     → Word16 -- ^ Register address.
                     → Word16 -- ^ Register value.
                     → S.Socket
@@ -317,9 +413,9 @@ writeSingleRegister tid pid uid addr value socket = do
                    socket
     return $ either Left (const $ Right ()) resp
 
-writeMultipleRegisters ∷ TransactionIdentifier
-                       → ProtocolIdentifier
-                       → UnitIdentifier
+writeMultipleRegisters ∷ TransactionId
+                       → ProtocolId
+                       → UnitId
                        → Word16 -- ^ Register starting address
                        → [Word16] -- ^ Register values to be written
                        → S.Socket
