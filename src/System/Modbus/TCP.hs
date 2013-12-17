@@ -1,5 +1,6 @@
-{-# LANGUAGE PackageImports #-}
-{-# LANGUAGE UnicodeSyntax  #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE PackageImports     #-}
+{-# LANGUAGE UnicodeSyntax      #-}
 
 -- | An implementation of the Modbus TPC/IP protocol.
 --
@@ -10,8 +11,8 @@ module System.Modbus.TCP
   ( TCP_ADU(..)
   , Header(..)
   , FunctionCode(..)
+  , ExceptionCode(..)
   , MB_Exception(..)
-  , Exception(..)
 
   , TransactionId
   , ProtocolId
@@ -29,9 +30,11 @@ module System.Modbus.TCP
   ) where
 
 import "base" Control.Applicative ( (<*>) )
+import "base" Control.Exception.Base ( Exception )
 import "base" Control.Monad ( replicateM, mzero )
 import "base" Data.Functor ( (<$>) )
 import "base" Data.Word ( Word8, Word16 )
+import "base" Data.Typeable ( Typeable )
 import "base-unicode-symbols" Data.Bool.Unicode     ( (∧), (∨) )
 import "base-unicode-symbols" Data.List.Unicode     ( (∈) )
 import "base-unicode-symbols" Data.Ord.Unicode      ( (≤), (≥) )
@@ -202,7 +205,7 @@ instance Serialize FunctionCode where
                | otherwise = OtherCode code
 
 -- | See: MODBUS Application Protocol Specification V1.1b, section 7
-data MB_Exception =
+data ExceptionCode =
     -- | The function code received in the query is not an allowable
     -- action for the server (or slave). This may be because the
     -- function code is only applicable to newer devices, and was not
@@ -267,7 +270,7 @@ data MB_Exception =
   | GatewayTargetDeviceFailedToRespond
     deriving Show
 
-instance Serialize MB_Exception where
+instance Serialize ExceptionCode where
   put = putWord8 ∘ enc
     where
       enc IllegalFunction                    = 0x01
@@ -293,10 +296,12 @@ instance Serialize MB_Exception where
       dec 0x0B = return GatewayTargetDeviceFailedToRespond
       dec _    = mzero
 
-data Exception = ExceptionResponse FunctionCode MB_Exception
-               | DecodeException String
-               | OtherException String
-                 deriving Show
+data MB_Exception = ExceptionResponse FunctionCode ExceptionCode
+                  | DecodeException String
+                  | OtherException String
+                    deriving (Show, Typeable)
+
+instance Exception MB_Exception
 
 -- | Sends a raw MODBUS command.
 command ∷ TransactionId
@@ -305,7 +310,7 @@ command ∷ TransactionId
         → FunctionCode -- ^ PDU function code.
         → ByteString   -- ^ PDU data.
         → S.Socket
-        → IO (Either Exception TCP_ADU)
+        → IO (Either MB_Exception TCP_ADU)
 command tid pid uid fc fdata socket = do
     _ ← S.send socket $ encode cmd
     result ← S.recv socket 512
@@ -316,7 +321,7 @@ command tid pid uid fc fdata socket = do
                   fdata
 
 -- | Checks whether the response contains an error.
-checkResponse ∷ TCP_ADU → Either Exception TCP_ADU
+checkResponse ∷ TCP_ADU → Either MB_Exception TCP_ADU
 checkResponse adu@(TCP_ADU _ fc bs) =
     case fc of
       ExceptionCode rc → Left $ either DecodeException (ExceptionResponse rc)
@@ -329,7 +334,7 @@ readCoils ∷ TransactionId
           → Word16
           → Word16
           → S.Socket
-          → IO (Either Exception [Word8])
+          → IO (Either MB_Exception [Word8])
 readCoils tid pid uid addr count socket =
     either Left
            ( either (Left ∘ DecodeException) Right
@@ -345,7 +350,7 @@ readDiscreteInputs ∷ TransactionId
                    → Word16
                    → Word16
                    → S.Socket
-                   → IO (Either Exception [Word8])
+                   → IO (Either MB_Exception [Word8])
 readDiscreteInputs tid pid uid addr count socket =
     either Left
            ( either (Left ∘ DecodeException) Right
@@ -361,7 +366,7 @@ readHoldingRegisters ∷ TransactionId
                      → Word16 -- ^ Register starting address.
                      → Word16 -- ^ Quantity of registers.
                      → S.Socket
-                     → IO (Either Exception [Word16])
+                     → IO (Either MB_Exception [Word16])
 readHoldingRegisters tid pid uid addr count socket =
     either Left
            ( either (Left ∘ DecodeException) Right
@@ -377,7 +382,7 @@ readInputRegisters ∷ TransactionId
                    → Word16 -- ^ Starting address.
                    → Word16 -- ^ Quantity of input registers.
                    → S.Socket
-                   → IO (Either Exception [Word16])
+                   → IO (Either MB_Exception [Word16])
 readInputRegisters tid pid uid addr count socket =
     either Left
            ( either (Left ∘ DecodeException) Right
@@ -393,7 +398,7 @@ writeSingleCoil ∷ TransactionId
                 → Word16
                 → Bool
                 → S.Socket
-                → IO (Either Exception ())
+                → IO (Either MB_Exception ())
 writeSingleCoil tid pid uid addr value socket = do
     resp ← command tid pid uid WriteSingleCoil
                    (runPut $ putWord16be addr >> putWord16be (if value then 0xFF00 else 0))
@@ -406,7 +411,7 @@ writeSingleRegister ∷ TransactionId
                     → Word16 -- ^ Register address.
                     → Word16 -- ^ Register value.
                     → S.Socket
-                    → IO (Either Exception ())
+                    → IO (Either MB_Exception ())
 writeSingleRegister tid pid uid addr value socket = do
     resp ← command tid pid uid WriteSingleRegister
                    (runPut $ putWord16be addr >> putWord16be value)
@@ -419,7 +424,7 @@ writeMultipleRegisters ∷ TransactionId
                        → Word16 -- ^ Register starting address
                        → [Word16] -- ^ Register values to be written
                        → S.Socket
-                       → IO (Either Exception Word16)
+                       → IO (Either MB_Exception Word16)
 writeMultipleRegisters tid pid uid addr values socket =
     either Left
            ( either (Left ∘ DecodeException) Right

@@ -1,5 +1,5 @@
 name:          modbus-tcp
-version:       0.0
+version:       0.1
 cabal-version: >= 1.8
 build-type:    Simple
 stability:     experimental
@@ -25,7 +25,7 @@ library
   build-depends: base                 >= 4.6   && < 4.7
                , base-unicode-symbols >= 0.1.1 && < 0.3
                , bytestring           >= 0.10  && < 0.11
-               , cereal               >= 0.3.5 && < 0.4
+               , cereal               >= 0.3.5 && < 0.5
                , network              >= 2.4.1 && < 2.5
 
   exposed-modules: System.Modbus.TCP
