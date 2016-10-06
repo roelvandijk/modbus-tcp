@@ -62,7 +62,7 @@ data TCP_ADU
      { aduHeader   :: Header
      , aduFunction :: FunctionCode
      , aduData     :: ByteString
-     } deriving Show
+     } deriving (Eq, Show)
 
 instance Serialize TCP_ADU where
   put (TCP_ADU header fc ws) = do
@@ -85,7 +85,7 @@ data Header
      , hdrProtocolId    :: ProtocolId
      , hdrLength        :: Word16
      , hdrUnitId        :: UnitId
-     } deriving Show
+     } deriving (Eq, Show)
 
 instance Serialize Header where
     put (Header tid pid len uid) =
@@ -148,7 +148,7 @@ data FunctionCode
    | ReservedCode Word8
    | OtherCode Word8
    | ExceptionCode FunctionCode
-     deriving Show
+     deriving (Eq, Show)
 
 instance Serialize FunctionCode where
   put = putWord8 . enc
@@ -271,7 +271,7 @@ data ExceptionCode
      -- no response was obtained from the target device. Usually means
      -- that the device is not present on the network.
    | GatewayTargetDeviceFailedToRespond
-     deriving Show
+     deriving (Eq, Show)
 
 instance Serialize ExceptionCode where
   put = putWord8 . enc
@@ -303,7 +303,7 @@ data MB_Exception
    = ExceptionResponse FunctionCode ExceptionCode
    | DecodeException String
    | OtherException String
-     deriving (Show, Typeable)
+     deriving (Eq, Show, Typeable)
 
 instance Exception MB_Exception
 
