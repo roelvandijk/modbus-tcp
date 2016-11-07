@@ -30,6 +30,7 @@ module System.Modbus.TCP
 
 import "base" Control.Exception.Base ( Exception )
 import "base" Control.Monad ( replicateM, mzero )
+import "base" Control.Monad.IO.Class ( liftIO )
 import "base" Data.Functor ( void )
 import "base" Data.Functor.Identity ( runIdentity )
 import "base" Data.Word ( Word8, Word16 )
@@ -46,7 +47,6 @@ import           "bytestring" Data.ByteString ( ByteString )
 import qualified "bytestring" Data.ByteString as BS
 import qualified "network" Network.Socket as S hiding ( send, recv )
 import qualified "network" Network.Socket.ByteString as S ( send, recv )
-import "transformers" Control.Monad.IO.Class ( liftIO )
 import "transformers" Control.Monad.Trans.Except
 
 
