@@ -1,5 +1,6 @@
 {-# language DeriveDataTypeable #-}
-{-# language PackageImports     #-}
+{-# language GeneralizedNewtypeDeriving #-}
+{-# language PackageImports #-}
 
 -- | An implementation of the Modbus TPC/IP protocol.
 --
@@ -7,7 +8,12 @@
 -- Specification V1.1b@
 -- (<http://www.modbus.org/docs/Modbus_Application_Protocol_V1_1b.pdf>).
 module System.Modbus.TCP
-  ( TCP_ADU(..)
+  ( -- * Session Monad
+    Session
+  , runSession
+
+    -- * Types
+  , TCP_ADU(..)
   , Header(..)
   , FunctionCode(..)
   , ExceptionCode(..)
@@ -17,6 +23,7 @@ module System.Modbus.TCP
   , ProtocolId
   , UnitId
 
+    -- * Commands
   , command
 
   , readCoils
@@ -30,29 +37,61 @@ module System.Modbus.TCP
 
 import "base" Control.Exception.Base ( Exception )
 import "base" Control.Monad ( replicateM, mzero )
-import "base" Control.Monad.IO.Class ( liftIO )
+import "base" Control.Monad.IO.Class ( MonadIO, liftIO )
 import "base" Data.Functor ( void )
-import "base" Data.Functor.Identity ( runIdentity )
 import "base" Data.Word ( Word8, Word16 )
 import "base" Data.Typeable ( Typeable )
+import "base" System.Timeout ( timeout )
+import qualified "cereal" Data.Serialize as Cereal ( encode, decode )
 import "cereal" Data.Serialize
   ( Serialize, Put, put, Get, get
-  , encode, decode
   , runPut, runGet
   , putWord8, putWord16be
   , getWord8, getWord16be
   , getByteString
   )
-import           "bytestring" Data.ByteString ( ByteString )
+import "bytestring" Data.ByteString ( ByteString )
 import qualified "bytestring" Data.ByteString as BS
+import "mtl" Control.Monad.Reader ( MonadReader, ask )
+import "mtl" Control.Monad.Except ( MonadError, throwError )
 import qualified "network" Network.Socket as S hiding ( send, recv )
 import qualified "network" Network.Socket.ByteString as S ( send, recv )
+import "transformers" Control.Monad.Trans.Class ( lift )
 import "transformers" Control.Monad.Trans.Except
+    ( ExceptT(ExceptT), withExceptT )
+import "transformers" Control.Monad.Trans.Reader
+    ( ReaderT, runReaderT )
 
 
 type TransactionId = Word16
 type ProtocolId    = Word16
 type UnitId        = Word8
+
+data Env
+   = Env
+     { envSocket :: !S.Socket
+     , envCommandTimeout :: !Int
+     }
+
+newtype Session a
+      = Session
+        { runSession' :: ReaderT Env (ExceptT MB_Exception IO) a
+        } deriving ( Functor
+                   , Applicative
+                   , Monad
+                   , MonadError MB_Exception
+                   , MonadReader Env
+                   , MonadIO
+                   )
+
+runSession :: Int -> S.Socket -> Session a -> ExceptT MB_Exception IO a
+runSession commandTimeout socket session =
+    runReaderT (runSession' session) env
+  where
+    env = Env
+          { envSocket = socket
+          , envCommandTimeout = commandTimeout
+          }
 
 -- | MODBUS TCP/IP Application Data Unit
 --
@@ -300,9 +339,10 @@ instance Serialize ExceptionCode where
       dec _    = mzero
 
 data MB_Exception
-   = ExceptionResponse FunctionCode ExceptionCode
-   | DecodeException String
-   | OtherException String
+   = ExceptionResponse !FunctionCode !ExceptionCode
+   | DecodeException !String
+   | CommandTimeout
+   | OtherException !String
      deriving (Eq, Show, Typeable)
 
 instance Exception MB_Exception
@@ -314,29 +354,25 @@ command
     -> UnitId
     -> FunctionCode -- ^ PDU function code.
     -> ByteString   -- ^ PDU data.
-    -> S.Socket
-    -> ExceptT MB_Exception IO TCP_ADU
-command tid pid uid fc fdata socket = do
-    result <- liftIO $ do
-      void $ S.send socket $ encode cmd
+    -> Session TCP_ADU
+command tid pid uid fc fdata = do
+    Env socket commandTimeout <- ask
+    mbResult <- liftIO $ timeout commandTimeout $ do
+      void $ S.send socket $ Cereal.encode cmd
       S.recv socket 512
+    result <- maybe (throwError CommandTimeout) pure mbResult
 
-    adu <- withExceptT DecodeException $ ExceptT $ pure $ decode result
-    mapExceptT (pure . runIdentity)
-               (checkResponse adu)
+    adu <- Session $ lift $ withExceptT DecodeException $ ExceptT $ pure $ Cereal.decode result
+    case aduFunction adu of
+      ExceptionCode rc ->
+          throwError
+            $ either DecodeException (ExceptionResponse rc)
+            $ Cereal.decode (aduData adu)
+      _ -> pure adu
   where
     cmd = TCP_ADU (Header tid pid (fromIntegral $ 2 + BS.length fdata) uid)
                   fc
                   fdata
-
--- | Checks whether the response contains an error.
-checkResponse :: TCP_ADU -> Except MB_Exception TCP_ADU
-checkResponse adu@(TCP_ADU _ fc bs) =
-    case fc of
-      ExceptionCode rc ->
-          throwE $ either DecodeException (ExceptionResponse rc)
-                 $ decode bs
-      _ -> pure adu
 
 readCoils
     :: TransactionId
@@ -344,10 +380,9 @@ readCoils
     -> UnitId
     -> Word16
     -> Word16
-    -> S.Socket
-    -> ExceptT MB_Exception IO [Word8]
-readCoils tid pid uid addr count socket =
-    withAduData tid pid uid ReadCoils socket
+    -> Session [Word8]
+readCoils tid pid uid addr count =
+    withAduData tid pid uid ReadCoils
                 (putWord16be addr >> putWord16be count)
                 decodeW8s
 
@@ -357,10 +392,9 @@ readDiscreteInputs
     -> UnitId
     -> Word16
     -> Word16
-    -> S.Socket
-    -> ExceptT MB_Exception IO [Word8]
-readDiscreteInputs tid pid uid addr count socket =
-    withAduData tid pid uid ReadDiscreteInputs socket
+    -> Session [Word8]
+readDiscreteInputs tid pid uid addr count =
+    withAduData tid pid uid ReadDiscreteInputs
                 (putWord16be addr >> putWord16be count)
                 decodeW8s
 
@@ -370,10 +404,9 @@ readHoldingRegisters
     -> UnitId
     -> Word16 -- ^ Register starting address.
     -> Word16 -- ^ Quantity of registers.
-    -> S.Socket
-    -> ExceptT MB_Exception IO [Word16]
-readHoldingRegisters tid pid uid addr count socket =
-    withAduData tid pid uid ReadHoldingRegisters socket
+    -> Session [Word16]
+readHoldingRegisters tid pid uid addr count =
+    withAduData tid pid uid ReadHoldingRegisters
                 (putWord16be addr >> putWord16be count)
                 decodeW16s
 
@@ -383,10 +416,9 @@ readInputRegisters
     -> UnitId
     -> Word16 -- ^ Starting address.
     -> Word16 -- ^ Quantity of input registers.
-    -> S.Socket
-    -> ExceptT MB_Exception IO [Word16]
-readInputRegisters tid pid uid addr count socket =
-    withAduData tid pid uid ReadInputRegisters socket
+    -> Session [Word16]
+readInputRegisters tid pid uid addr count =
+    withAduData tid pid uid ReadInputRegisters
                 (putWord16be addr >> putWord16be count)
                 decodeW16s
 
@@ -396,12 +428,10 @@ writeSingleCoil
     -> UnitId
     -> Word16
     -> Bool
-    -> S.Socket
-    -> ExceptT MB_Exception IO ()
-writeSingleCoil tid pid uid addr value socket =
+    -> Session ()
+writeSingleCoil tid pid uid addr value =
     void $ command tid pid uid WriteSingleCoil
                    (runPut $ putWord16be addr >> putWord16be value')
-                   socket
   where
     value' | value     = 0xFF00
            | otherwise = 0x0000
@@ -412,12 +442,10 @@ writeSingleRegister
     -> UnitId
     -> Word16 -- ^ Register address.
     -> Word16 -- ^ Register value.
-    -> S.Socket
-    -> ExceptT MB_Exception IO ()
-writeSingleRegister tid pid uid addr value socket =
+    -> Session ()
+writeSingleRegister tid pid uid addr value =
     void $ command tid pid uid WriteSingleRegister
                    (runPut $ putWord16be addr >> putWord16be value)
-                   socket
 
 writeMultipleRegisters
     :: TransactionId
@@ -425,10 +453,9 @@ writeMultipleRegisters
     -> UnitId
     -> Word16 -- ^ Register starting address
     -> [Word16] -- ^ Register values to be written
-    -> S.Socket
-    -> ExceptT MB_Exception IO Word16
-writeMultipleRegisters tid pid uid addr values socket =
-    withAduData tid pid uid WriteMultipleRegisters socket
+    -> Session Word16
+writeMultipleRegisters tid pid uid addr values =
+    withAduData tid pid uid WriteMultipleRegisters
                 (do putWord16be addr
                     putWord16be $ fromIntegral numRegs
                     putWord8    $ fromIntegral numRegs
@@ -446,13 +473,12 @@ withAduData
     -> ProtocolId
     -> UnitId
     -> FunctionCode
-    -> S.Socket
     -> Put -- ^ PDU data
     -> Get a -- ^ Parser of resulting 'aduData'
-    -> ExceptT MB_Exception IO a
-withAduData tid pid uid fc socket fdata parser = do
-    adu <- command tid pid uid fc (runPut fdata) socket
-    withExceptT DecodeException $ ExceptT $ pure $ runGet parser $ aduData adu
+    -> Session a
+withAduData tid pid uid fc fdata parser = do
+    adu <- command tid pid uid fc (runPut fdata)
+    Session $ lift $ withExceptT DecodeException $ ExceptT $ pure $ runGet parser $ aduData adu
 
 decodeW8s :: Get [Word8]
 decodeW8s = do n <- getWord8

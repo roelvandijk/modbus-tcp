@@ -4,12 +4,12 @@ let
 
   inherit (nixpkgs) pkgs;
 
-  f = { mkDerivation, base, bytestring, cereal, network, transformers, stdenv }:
+  f = { mkDerivation, base, bytestring, cereal, mtl, network, transformers, stdenv }:
       mkDerivation {
         pname = "modbus-tcp";
         version = "0.2";
         src = ./.;
-        libraryHaskellDepends = [ base bytestring cereal network transformers ];
+        libraryHaskellDepends = [ base bytestring cereal mtl network transformers ];
         homepage = "https://github.com/roelvandijk/modbus-tcp";
         description = "Communicate with Modbus devices over TCP";
         license = stdenv.lib.licenses.bsd3;
