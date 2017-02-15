@@ -12,12 +12,15 @@ module System.Modbus.TCP
     Session
   , runSession
 
+    -- * Connections
+  , Connection(..)
+
     -- * Types
   , TCP_ADU(..)
   , Header(..)
   , FunctionCode(..)
   , ExceptionCode(..)
-  , MB_Exception(..)
+  , ModbusException(..)
 
   , TransactionId
   , ProtocolId
@@ -39,6 +42,7 @@ import "base" Control.Exception.Base ( Exception )
 import "base" Control.Monad ( replicateM, mzero )
 import "base" Control.Monad.IO.Class ( MonadIO, liftIO )
 import "base" Data.Functor ( void )
+import "base" Data.Maybe ( fromMaybe )
 import "base" Data.Word ( Word8, Word16 )
 import "base" Data.Typeable ( Typeable )
 import "base" System.Timeout ( timeout )
@@ -53,9 +57,7 @@ import "cereal" Data.Serialize
 import "bytestring" Data.ByteString ( ByteString )
 import qualified "bytestring" Data.ByteString as BS
 import "mtl" Control.Monad.Reader ( MonadReader, ask )
-import "mtl" Control.Monad.Except ( MonadError, throwError )
-import qualified "network" Network.Socket as S hiding ( send, recv )
-import qualified "network" Network.Socket.ByteString as S ( send, recv )
+import "mtl" Control.Monad.Except ( MonadError, throwError, catchError )
 import "transformers" Control.Monad.Trans.Class ( lift )
 import "transformers" Control.Monad.Trans.Except
     ( ExceptT(ExceptT), withExceptT )
@@ -67,31 +69,45 @@ type TransactionId = Word16
 type ProtocolId    = Word16
 type UnitId        = Word8
 
-data Env
-   = Env
-     { envSocket :: !S.Socket
-     , envCommandTimeout :: !Int
+data Connection
+   = Connection
+     { connWrite :: !(BS.ByteString -> IO Int)
+       -- ^ Action that writes bytes.
+       --
+       -- You can use Network.Socket.ByteString.send applied to some
+       -- socket, or some custom function.
+     , connRead :: !(Int -> IO BS.ByteString)
+       -- ^ Action that reads bytes.
+       --
+       -- You can use Network.Socket.ByteString.recv applied to some
+       -- socket, or some custom function.
+     , connCommandTimeout :: !Int
+       -- ^ Time limit in microseconds for each command.
+     , connMaxTries :: !Int
+       -- ^ Maximum number of tries for each command. A command will
+       -- result in a `ModbusException` if all tries fail.
+       --
+       -- It is an error (`NoTriesAllowed`) to set this number to a
+       -- value <= 0.
      }
 
+-- | Modbus TCP session monad.
 newtype Session a
       = Session
-        { runSession' :: ReaderT Env (ExceptT MB_Exception IO) a
+        { runSession' :: ReaderT Connection (ExceptT ModbusException IO) a
         } deriving ( Functor
                    , Applicative
                    , Monad
-                   , MonadError MB_Exception
-                   , MonadReader Env
+                   , MonadError ModbusException
+                   , MonadReader Connection
                    , MonadIO
                    )
 
-runSession :: Int -> S.Socket -> Session a -> ExceptT MB_Exception IO a
-runSession commandTimeout socket session =
-    runReaderT (runSession' session) env
-  where
-    env = Env
-          { envSocket = socket
-          , envCommandTimeout = commandTimeout
-          }
+-- | Run a session using a connection.
+--
+--
+runSession :: Connection -> Session a -> ExceptT ModbusException IO a
+runSession conn session = runReaderT (runSession' session) conn
 
 -- | MODBUS TCP/IP Application Data Unit
 --
@@ -338,14 +354,19 @@ instance Serialize ExceptionCode where
       dec 0x0B = return GatewayTargetDeviceFailedToRespond
       dec _    = mzero
 
-data MB_Exception
+data ModbusException
    = ExceptionResponse !FunctionCode !ExceptionCode
    | DecodeException !String
    | CommandTimeout
+     -- ^ A command took longer than 'connCommandTimeout'
+     -- microseconds.
+   | NoTriesAllowed
+     -- ^ Command attempted while 'connMaxTries' <= 0. This is a
+     -- configuration error.
    | OtherException !String
      deriving (Eq, Show, Typeable)
 
-instance Exception MB_Exception
+instance Exception ModbusException
 
 -- | Sends a raw MODBUS command.
 command
@@ -356,13 +377,36 @@ command
     -> ByteString   -- ^ PDU data.
     -> Session TCP_ADU
 command tid pid uid fc fdata = do
-    Env socket commandTimeout <- ask
-    mbResult <- liftIO $ timeout commandTimeout $ do
-      void $ S.send socket $ Cereal.encode cmd
-      S.recv socket 512
+    conn <- ask
+    Session $ lift $ withConn conn
+  where
+    withConn :: Connection -> ExceptT ModbusException IO TCP_ADU
+    withConn conn = go 0 Nothing
+      where
+        go :: Int -> Maybe ModbusException -> ExceptT ModbusException IO TCP_ADU
+        go tries mbLastError
+            | tries >= connMaxTries conn =
+                throwError $ fromMaybe NoTriesAllowed mbLastError
+            | otherwise =
+                catchError
+                  (command' conn tid pid uid fc fdata)
+                  (\err -> go (tries + 1) (Just err))
+
+command'
+    :: Connection
+    -> TransactionId
+    -> ProtocolId
+    -> UnitId
+    -> FunctionCode -- ^ PDU function code.
+    -> ByteString   -- ^ PDU data.
+    -> ExceptT ModbusException IO TCP_ADU
+command' conn tid pid uid fc fdata = do
+    mbResult <- liftIO $ timeout (connCommandTimeout conn) $ do
+      void $ connWrite conn (Cereal.encode cmd)
+      connRead conn 512
     result <- maybe (throwError CommandTimeout) pure mbResult
 
-    adu <- Session $ lift $ withExceptT DecodeException $ ExceptT $ pure $ Cereal.decode result
+    adu <- withExceptT DecodeException $ ExceptT $ pure $ Cereal.decode result
     case aduFunction adu of
       ExceptionCode rc ->
           throwError
