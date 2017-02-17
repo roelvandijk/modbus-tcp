@@ -1,3 +1,4 @@
+{-# language BangPatterns #-}
 {-# language DeriveDataTypeable #-}
 {-# language GeneralizedNewtypeDeriving #-}
 {-# language PackageImports #-}
@@ -22,9 +23,12 @@ module System.Modbus.TCP
   , ExceptionCode(..)
   , ModbusException(..)
 
-  , TransactionId
-  , ProtocolId
-  , UnitId
+  , TransactionId(..)
+  , ProtocolId(..)
+  , UnitId(..)
+  , RegAddress(..)
+
+  , RetryPredicate
 
     -- * Commands
   , command
@@ -41,8 +45,8 @@ module System.Modbus.TCP
 import "base" Control.Exception.Base ( Exception )
 import "base" Control.Monad ( replicateM, mzero )
 import "base" Control.Monad.IO.Class ( MonadIO, liftIO )
+import "base" Data.Bool ( bool )
 import "base" Data.Functor ( void )
-import "base" Data.Maybe ( fromMaybe )
 import "base" Data.Word ( Word8, Word16 )
 import "base" Data.Typeable ( Typeable )
 import "base" System.Timeout ( timeout )
@@ -64,10 +68,29 @@ import "transformers" Control.Monad.Trans.Except
 import "transformers" Control.Monad.Trans.Reader
     ( ReaderT, runReaderT )
 
+newtype TransactionId
+      = TransactionId { unTransactionId :: Word16 }
+        deriving (Eq, Num, Ord, Read, Show)
 
-type TransactionId = Word16
-type ProtocolId    = Word16
-type UnitId        = Word8
+newtype ProtocolId
+      = ProtocolId { unProtocolId :: Word16 }
+        deriving (Eq, Num, Ord, Read, Show)
+
+newtype UnitId
+      = UnitId { unUnitId :: Word8 }
+        deriving (Bounded, Enum, Eq, Num, Ord, Read, Show)
+
+newtype RegAddress
+      = RegAddress { unRegAddress :: Word16 }
+        deriving (Bounded, Enum, Eq, Num, Ord, Read, Show)
+
+type RetryPredicate
+   =  Int -- ^ Number of tries.
+   -> ModbusException
+      -- ^ Exception raised by the latest attempt to execute a command.
+   -> Bool
+      -- ^ If 'True' the command will be retried, if 'False' the
+      -- aforementioned 'ModbusException' will be rethrown.
 
 data Connection
    = Connection
@@ -83,12 +106,9 @@ data Connection
        -- socket, or some custom function.
      , connCommandTimeout :: !Int
        -- ^ Time limit in microseconds for each command.
-     , connMaxTries :: !Int
-       -- ^ Maximum number of tries for each command. A command will
-       -- result in a `ModbusException` if all tries fail.
-       --
-       -- It is an error (`NoTriesAllowed`) to set this number to a
-       -- value <= 0.
+     , connRetryWhen :: !RetryPredicate
+       -- ^ Predicate that determines whether a failed command should
+       -- be retried.
      }
 
 -- | Modbus TCP session monad.
@@ -104,8 +124,6 @@ newtype Session a
                    )
 
 -- | Run a session using a connection.
---
---
 runSession :: Connection -> Session a -> ExceptT ModbusException IO a
 runSession conn session = runReaderT (runSession' session) conn
 
@@ -114,9 +132,9 @@ runSession conn session = runReaderT (runSession' session) conn
 -- See: MODBUS Application Protocol Specification V1.1b, section 4.1
 data TCP_ADU
    = TCP_ADU
-     { aduHeader   :: Header
-     , aduFunction :: FunctionCode
-     , aduData     :: ByteString
+     { aduHeader   :: !Header
+     , aduFunction :: !FunctionCode
+     , aduData     :: !ByteString
      } deriving (Eq, Show)
 
 instance Serialize TCP_ADU where
@@ -136,16 +154,20 @@ instance Serialize TCP_ADU where
 -- See: MODBUS Application Protocol Specification V1.1b, section 4.1
 data Header
    = Header
-     { hdrTransactionId :: TransactionId
-     , hdrProtocolId    :: ProtocolId
-     , hdrLength        :: Word16
-     , hdrUnitId        :: UnitId
+     { hdrTransactionId :: !TransactionId
+     , hdrProtocolId    :: !ProtocolId
+     , hdrLength        :: !Word16
+     , hdrUnitId        :: !UnitId
      } deriving (Eq, Show)
 
 instance Serialize Header where
-    put (Header tid pid len uid) =
+    put (Header (TransactionId tid) (ProtocolId pid) len (UnitId uid)) =
       putWord16be tid >> putWord16be pid >> putWord16be len >> putWord8 uid
-    get = Header <$> getWord16be <*> getWord16be <*> getWord16be <*> getWord8
+    get = Header
+          <$> (TransactionId <$> getWord16be)
+          <*> (ProtocolId    <$> getWord16be)
+          <*> getWord16be
+          <*> (UnitId <$> getWord8)
 
 -- | The function code field of a MODBUS data unit is coded in one
 -- byte. Valid codes are in the range of 1 ... 255 decimal (the range
@@ -360,9 +382,6 @@ data ModbusException
    | CommandTimeout
      -- ^ A command took longer than 'connCommandTimeout'
      -- microseconds.
-   | NoTriesAllowed
-     -- ^ Command attempted while 'connMaxTries' <= 0. This is a
-     -- configuration error.
    | OtherException !String
      deriving (Eq, Show, Typeable)
 
@@ -381,16 +400,17 @@ command tid pid uid fc fdata = do
     Session $ lift $ withConn conn
   where
     withConn :: Connection -> ExceptT ModbusException IO TCP_ADU
-    withConn conn = go 0 Nothing
+    withConn conn = go 1
       where
-        go :: Int -> Maybe ModbusException -> ExceptT ModbusException IO TCP_ADU
-        go tries mbLastError
-            | tries >= connMaxTries conn =
-                throwError $ fromMaybe NoTriesAllowed mbLastError
-            | otherwise =
-                catchError
-                  (command' conn tid pid uid fc fdata)
-                  (\err -> go (tries + 1) (Just err))
+        go :: Int -> ExceptT ModbusException IO TCP_ADU
+        go !tries =
+            catchError
+              (command' conn tid pid uid fc fdata)
+              (\err ->
+                bool (throwError err)
+                     (go $ tries + 1)
+                     (connRetryWhen conn tries err)
+              )
 
 command'
     :: Connection
@@ -422,60 +442,60 @@ readCoils
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16
+    -> RegAddress
     -> Word16
     -> Session [Word8]
 readCoils tid pid uid addr count =
     withAduData tid pid uid ReadCoils
-                (putWord16be addr >> putWord16be count)
+                (putRegAddress addr >> putWord16be count)
                 decodeW8s
 
 readDiscreteInputs
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16
+    -> RegAddress
     -> Word16
     -> Session [Word8]
 readDiscreteInputs tid pid uid addr count =
     withAduData tid pid uid ReadDiscreteInputs
-                (putWord16be addr >> putWord16be count)
+                (putRegAddress addr >> putWord16be count)
                 decodeW8s
 
 readHoldingRegisters
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16 -- ^ Register starting address.
+    -> RegAddress -- ^ Register starting address.
     -> Word16 -- ^ Quantity of registers.
     -> Session [Word16]
 readHoldingRegisters tid pid uid addr count =
     withAduData tid pid uid ReadHoldingRegisters
-                (putWord16be addr >> putWord16be count)
+                (putRegAddress addr >> putWord16be count)
                 decodeW16s
 
 readInputRegisters
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16 -- ^ Starting address.
+    -> RegAddress -- ^ Starting address.
     -> Word16 -- ^ Quantity of input registers.
     -> Session [Word16]
 readInputRegisters tid pid uid addr count =
     withAduData tid pid uid ReadInputRegisters
-                (putWord16be addr >> putWord16be count)
+                (putRegAddress addr >> putWord16be count)
                 decodeW16s
 
 writeSingleCoil
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16
+    -> RegAddress
     -> Bool
     -> Session ()
 writeSingleCoil tid pid uid addr value =
     void $ command tid pid uid WriteSingleCoil
-                   (runPut $ putWord16be addr >> putWord16be value')
+                   (runPut $ putRegAddress addr >> putWord16be value')
   where
     value' | value     = 0xFF00
            | otherwise = 0x0000
@@ -484,23 +504,23 @@ writeSingleRegister
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16 -- ^ Register address.
+    -> RegAddress -- ^ Register address.
     -> Word16 -- ^ Register value.
     -> Session ()
 writeSingleRegister tid pid uid addr value =
     void $ command tid pid uid WriteSingleRegister
-                   (runPut $ putWord16be addr >> putWord16be value)
+                   (runPut $ putRegAddress addr >> putWord16be value)
 
 writeMultipleRegisters
     :: TransactionId
     -> ProtocolId
     -> UnitId
-    -> Word16 -- ^ Register starting address
+    -> RegAddress -- ^ Register starting address
     -> [Word16] -- ^ Register values to be written
     -> Session Word16
 writeMultipleRegisters tid pid uid addr values =
     withAduData tid pid uid WriteMultipleRegisters
-                (do putWord16be addr
+                (do putRegAddress addr
                     putWord16be $ fromIntegral numRegs
                     putWord8    $ fromIntegral numRegs
                     mapM_ putWord16be values
@@ -523,6 +543,9 @@ withAduData
 withAduData tid pid uid fc fdata parser = do
     adu <- command tid pid uid fc (runPut fdata)
     Session $ lift $ withExceptT DecodeException $ ExceptT $ pure $ runGet parser $ aduData adu
+
+putRegAddress :: RegAddress -> Put
+putRegAddress = putWord16be . unRegAddress
 
 decodeW8s :: Get [Word8]
 decodeW8s = do n <- getWord8

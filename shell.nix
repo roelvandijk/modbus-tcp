@@ -6,7 +6,7 @@ let
   f = { mkDerivation, base, bytestring, cereal, mtl, transformers, stdenv }:
       mkDerivation {
         pname = "modbus-tcp";
-        version = "0.4";
+        version = "0.5";
         src = ./.;
         libraryHaskellDepends = [ base bytestring cereal mtl transformers ];
         homepage = "https://github.com/roelvandijk/modbus-tcp";

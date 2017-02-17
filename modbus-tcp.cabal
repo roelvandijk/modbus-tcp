@@ -1,11 +1,11 @@
 name:          modbus-tcp
-version:       0.4
+version:       0.5
 cabal-version: >= 1.10
 build-type:    Simple
 stability:     experimental
 author:        Roel van Dijk <roel@lambdacube.nl>, Tim Schwarte <tim@timschwarte.nl>
 maintainer:    Roel van Dijk <roel@lambdacube.nl>
-copyright:     2013–2016 Roel van Dijk, Tim Schwarte
+copyright:     2013–2017 Roel van Dijk, Tim Schwarte
 license:       BSD3
 license-file:  LICENSE
 homepage:      https://github.com/roelvandijk/modbus-tcp
